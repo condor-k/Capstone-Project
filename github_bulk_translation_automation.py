@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -27,7 +28,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -35,10 +35,10 @@ API_BASE = "https://api.github.com"
 OLD_USERNAME = "ahmetburakgozel"
 NEW_USERNAME = "condor-k"
 DEFAULT_WORKSPACE = Path("/tmp/github-repo-translation-workspace")
+WIKI_MANUAL_NOTE = "Wiki updates require git push to <repo>.wiki.git and are logged as manual step."
 
 TRANSLATION_DICTIONARY = {
     "proje": "project",
-    "kapstone": "capstone",
     "açıklama": "description",
     "degisiklik": "change",
     "değişiklik": "change",
@@ -54,8 +54,6 @@ TRANSLATION_DICTIONARY = {
     "iyileştirme": "improvement",
     "iyilestirme": "improvement",
     "çekme isteği": "pull request",
-    "pull request": "pull request",
-    "commit": "commit",
 }
 
 TEXT_WHITELIST_EXTENSIONS = {
@@ -268,13 +266,7 @@ class GitHubClient:
                     return min(int(retry_after), 120)
                 except ValueError:
                     pass
-            date_header = headers.get("Date")
-            if date_header:
-                try:
-                    parsedate_to_datetime(date_header)
-                except (TypeError, ValueError):
-                    pass
-        return min(2 ** attempt, 60)
+        return min(2 ** (attempt - 1), 60)
 
     def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
         url = path
@@ -316,18 +308,17 @@ class TextTransformer:
         self.dictionary = dictionary
         self.old_username = old_username
         self.new_username = new_username
+        self._compiled_rules: List[Tuple[re.Pattern[str], str]] = []
+        for source, target in dictionary.items():
+            pattern = re.compile(rf"\b{re.escape(source)}\b", flags=re.IGNORECASE)
+            self._compiled_rules.append((pattern, target))
 
     def transform(self, text: Optional[str]) -> Optional[str]:
         if text is None:
             return None
         updated = text.replace(self.old_username, self.new_username)
-        for source, target in self.dictionary.items():
-            updated = re.sub(
-                rf"\b{re.escape(source)}\b",
-                target,
-                updated,
-                flags=re.IGNORECASE,
-            )
+        for pattern, target in self._compiled_rules:
+            updated = pattern.sub(target, updated)
         return updated
 
 
@@ -680,7 +671,7 @@ def apply_api_updates(
             "prs_updated": prs_updated,
             "issues_updated": issues_updated,
             "releases_updated": releases_updated,
-            "wiki_note": "Wiki updates require git push to <repo>.wiki.git and are logged as manual step.",
+            "wiki_note": WIKI_MANUAL_NOTE,
         }
         summaries.append(summary)
         logger.log("api_update_summary", **summary)
@@ -719,17 +710,31 @@ def ensure_mirror_clone(owner: str, repo_name: str, workspace: Path, logger: Aud
 def generate_history_rewrite_commands(owner: str, repo_name: str, mirror_dir: Path, transformer: TextTransformer) -> List[str]:
     # Keep callback minimal and deterministic for username replacement and dictionary substitutions.
     replacements = [(OLD_USERNAME, NEW_USERNAME)] + list(TRANSLATION_DICTIONARY.items())
-    callback_lines = ["message = message.decode('utf-8', 'ignore')"]
+    callback_lines = [
+        "import re",
+        "message = message.decode('utf-8', 'replace')",
+        "# Apply strict username replacement first, then dictionary boundary-based substitutions.",
+    ]
     for source, target in replacements:
-        callback_lines.append(f"message = message.replace({source!r}, {target!r})")
+        if source == OLD_USERNAME:
+            callback_lines.append(f"message = message.replace({source!r}, {target!r})")
+        else:
+            callback_lines.append(
+                f"message = re.sub(r'\\\\b{re.escape(source)}\\\\b', {target!r}, message, flags=re.IGNORECASE)"
+            )
     callback_lines.append("return message.encode('utf-8')")
-    callback = "\\n".join(callback_lines)
-
-    cmd = (
-        "git filter-repo "
-        f"--force --message-callback \"{callback}\" "
-        "--refs refs/heads/* refs/tags/*"
-    )
+    callback = "\n".join(callback_lines)
+    cmd_parts = [
+        "git",
+        "filter-repo",
+        "--force",
+        "--message-callback",
+        callback,
+        "--refs",
+        "refs/heads/*",
+        "refs/tags/*",
+    ]
+    cmd = " ".join(shlex.quote(part) for part in cmd_parts)
     push_cmd = "git push --force --mirror"
     return [
         f"cd {mirror_dir}",
@@ -737,7 +742,7 @@ def generate_history_rewrite_commands(owner: str, repo_name: str, mirror_dir: Pa
         cmd,
         "# Validate rewritten history before force push.",
         "git fsck",
-        "git log --all --grep='ahmetburakgozel' || true",
+        f"git log --all --grep='{OLD_USERNAME}' || true",
         push_cmd,
     ]
 
@@ -792,7 +797,7 @@ def find_old_username_in_contents(root: Path) -> List[str]:
         if not is_probably_text_file(path):
             continue
         try:
-            content = path.read_text(encoding="utf-8", errors="ignore")
+            content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         if OLD_USERNAME in content:
@@ -853,7 +858,8 @@ def clone_repo_if_needed(owner: str, repo_name: str, workspace: Path, logger: Au
     if clone_dir.exists():
         rc, out, err = run_cmd(["git", "-C", str(clone_dir), "pull", "--ff-only"], None, logger)
         if rc != 0:
-            logger.log("clone_pull_failed", repo=repo_name, stdout=out[-500:], stderr=err[-500:])
+            logger.log("clone_pull_failed", repo=repo_name, stdout=(out or "")[-500:], stderr=(err or "")[-500:])
+            raise RuntimeError(f"Failed to update existing clone {clone_dir}: {out}\n{err}")
         return clone_dir
 
     remote = f"https://github.com/{owner}/{repo_name}.git"
@@ -866,10 +872,11 @@ def clone_repo_if_needed(owner: str, repo_name: str, workspace: Path, logger: Au
 def replace_in_worktree(repo_root: Path, transformer: TextTransformer, logger: AuditLogger) -> Dict[str, Any]:
     changed_files = 0
     renamed_paths = 0
+    rename_collisions = 0
 
     files_to_process: List[Path] = []
     for path in repo_root.rglob("*"):
-        if not path.exists() or not path.is_file():
+        if not path.is_file():
             continue
         rel = path.relative_to(repo_root).as_posix()
         if should_skip_path(rel):
@@ -879,10 +886,10 @@ def replace_in_worktree(repo_root: Path, transformer: TextTransformer, logger: A
         files_to_process.append(path)
 
     for file_path in files_to_process:
-        original = file_path.read_text(encoding="utf-8", errors="ignore")
+        original = file_path.read_text(encoding="utf-8", errors="replace")
         updated = transformer.transform(original)
-        if updated != original:
-            file_path.write_text(updated or "", encoding="utf-8")
+        if updated is not None and updated != original:
+            file_path.write_text(updated, encoding="utf-8")
             changed_files += 1
 
     # Rename files/folders in reverse depth order to avoid parent collisions.
@@ -895,11 +902,17 @@ def replace_in_worktree(repo_root: Path, transformer: TextTransformer, logger: A
         if new_name and new_name != path.name:
             target = path.with_name(new_name)
             if target.exists():
+                rename_collisions += 1
+                logger.log("worktree_rename_collision", path=str(path), target=str(target))
                 continue
             path.rename(target)
             renamed_paths += 1
 
-    result = {"changed_files": changed_files, "renamed_paths": renamed_paths}
+    result = {
+        "changed_files": changed_files,
+        "renamed_paths": renamed_paths,
+        "rename_collisions": rename_collisions,
+    }
     logger.log("worktree_replacements", repo_root=str(repo_root), **result)
     return result
 
@@ -946,6 +959,7 @@ def commit_and_optionally_push_worktree_changes(
 def build_pipeline_report(
     inventory: List[Dict[str, Any]],
     api_summaries: List[Dict[str, Any]],
+    worktree_actions: List[Dict[str, Any]],
     validations: List[Dict[str, Any]],
     history: List[Dict[str, Any]],
     logger: AuditLogger,
@@ -954,6 +968,7 @@ def build_pipeline_report(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "inventory": inventory,
         "api_updates": api_summaries,
+        "worktree_actions": worktree_actions,
         "validations": validations,
         "history_rewrite": history,
     }
@@ -1022,7 +1037,8 @@ def main() -> int:
 
     report_path = build_pipeline_report(
         inventory=inventory,
-        api_summaries=api_summaries + worktree_actions,
+        api_summaries=api_summaries,
+        worktree_actions=worktree_actions,
         validations=validations,
         history=history,
         logger=logger,
